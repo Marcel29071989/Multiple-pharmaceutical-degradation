@@ -1,0 +1,1651 @@
+
+---
+title: "Multiple pollutant"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+#libraries
+
+```{r}
+library(Rcpp)
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ShortRead)
+library(readxl)
+library(purrr)
+library(ggplot2)
+library(boot)
+library(tidyverse)
+library(lubridate)
+library(here)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(ggpubr)
+library(aod)
+library(skimr)
+library(scales)
+library(patchwork)
+library(broom)
+library(aod)
+library(Rcpp)
+library(microbiome)
+library(vegan)
+library(plyr)
+library(DESeq2)
+library(apeglm)
+library(patchwork)
+library(plotly)
+library(rstatix)
+library(ggrepel)
+
+```
+
+# function
+```{r}
+stderr <- function(x, na.rm=FALSE) {
+  if (na.rm) x <- na.omit(x)
+  sqrt(var(x)/length(x))
+}
+```
+
+
+# Function to extract t- anf F-values
+```{r}
+extract_test_values <- function(model,variable){
+  tidy_tibble_t <- tidy(model)
+  names(tidy_tibble_t)[names(tidy_tibble_t) == "statistic"] <- "t_statistic"
+  names(tidy_tibble_t)[names(tidy_tibble_t) == "p.value"] <- "t_p.value"
+  names(tidy_tibble_t)[names(tidy_tibble_t) == "term"] <- "treatment_combination"
+  
+  tidy_tibble_f <- tidy(anova(model))
+  names(tidy_tibble_f)[names(tidy_tibble_f) == "statistic"] <- "f_statistic"
+  names(tidy_tibble_f)[names(tidy_tibble_f) == "p.value"] <- "f_p.value"
+  names(tidy_tibble_f)[names(tidy_tibble_f) == "term"] <- "treatment_combination"
+
+  
+  tidy_tibble <- full_join(tidy_tibble_t, tidy_tibble_f, by="treatment_combination") %>%
+    mutate(color = ifelse(f_p.value < 0.05, estimate/max(abs(coef(model))), NA),
+           variable=variable) %>%
+    filter(treatment_combination != "(Intercept)", treatment_combination!="Residuals") 
+  # print(c(max(coef(model)),max(abs(coef(model)))))
+  return(tidy_tibble)
+}
+```
+
+
+# Load HPLC data 
+```{r}
+
+data <- read_excel("natalie_final.xlsx", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+```
+
+# make average and stderr
+
+```{r}
+data_area <- data %>%
+  group_by(Culture,Day) %>%
+  dplyr::summarise(Ibuprofen_mean = mean(Ibuprofen),
+                   Paracetamol_mean = mean(Paracetamol),
+                    Caffein_mean = mean(Caffein),
+                      Atenolol_mean = mean(Atenolol),
+                        Enalapril_mean = mean(Enalapril))
+
+
+data_error <- data%>%
+  group_by(Culture,Day) %>%
+  dplyr::summarise(Ibu_sd = stderr(Ibuprofen),
+                   Para_sd = stderr(Paracetamol),
+                    Caff_sd = stderr(Caffein),
+                      Ate_sd = stderr(Atenolol),
+                        Ena_sd = stderr(Enalapril))
+                 
+
+
+data_area  <- data_area %>%
+  pivot_longer(!c(Culture, Day),   names_to = "Substrate", values_to = "percentage")  
+    
+
+data_error  <- data_error%>%
+  pivot_longer(!c(Culture, Day),   names_to = "Substrate", values_to = "error") 
+
+data_error <- subset(data_error, select = -c(Culture,Day,Substrate))
+
+data_full <- cbind(data_area,data_error)
+
+data_full$Culture <- factor(data_full$Culture, levels=c("I","P","C","A","E", "IP","IC","IA","IE","PC","PA","PE","CA","CE","AE","IPC","IPA","IPE","ICA","ICE","IAE","PCA","PCE","PAE","CAE","IPCA","IPCE","IPAE","ICAE","PECA","IPCAE"))
+                            
+
+data_full<- data_full %>%
+  filter(Day!="1")
+
+
+data_full$percentage = ifelse(data_full$percentage>100,100, data_full$percentage)
+
+```
+
+#  supplementary figure 1: overview of the dynamics of the pollutants
+
+```{r}
+supplemetary_figure_1 <- data_full %>%
+    ggplot(aes(x = Day, y = percentage, col=Substrate)) +  
+  geom_point()+
+  geom_line()+
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+   theme(strip.background = element_rect(colour="black",
+                                        fill="white"))+
+  facet_wrap("Culture",scales="free", ncol=5) +
+  geom_hline(yintercept=50, linetype="dashed", color = "black")+
+    geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x=Day),width=0.1, size=0.5, color="grey")+
+  ylab("Pollutant [mg/L]")+
+    scale_x_continuous(breaks = seq(from = 0, to = 13, by = 1))+
+  ylim(0,100)
+
+print(supplemetary_figure_1)
+```
+
+# figure 1 preparation hplc: analysis of each pollutant
+
+```{r}
+# atenolol
+data_atenolol <- data_full %>%
+   filter(Substrate == "Atenolol_mean") 
+data_atenolol <- na.omit(data_atenolol)
+
+atenolol_a <- data_atenolol %>%
+   filter(Culture %in% c("A", "PA", "IA","IPA", "PECA")) %>%
+   ggplot(aes(x = as.factor(Day), y = percentage, col=Culture,group=Culture)) +   
+ geom_point()+
+  geom_line()+ 
+  geom_text_repel(data = subset(data_atenolol, as.factor(Day) == "11" & Culture %in% c("A", "PA", "IA","IPA", "PECA")),
+    aes(label = Culture),
+    size = 3,x=5.2,hjust="right",
+    segment.color = NA,x = 11)+
+    geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ylim(0, 100)+
+  ylab("atenolol \n[mg/L]")+
+  xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+  theme(legend.position = "none")
+
+atenolol_b <- data_atenolol %>%
+  filter(Substrate == "Atenolol_mean", Day =="11") %>%
+               ggplot(aes(x = Culture, y = percentage)) +  
+  geom_point()+
+  geom_hline(yintercept=50, linetype="dashed", color = "black")+
+    geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x=Culture),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+       theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7)) +
+    ylab("atenolol \n[mg/L] day 11")+
+ theme(strip.background = element_rect(colour="black",
+                                        fill="white"))+
+    theme(plot.title = element_text(size = 10))+
+  theme(axis.title.x = element_text(vjust=2.5))
+
+
+# ibuprofen
+
+data_ibuprofen <- data_full %>%
+   filter(Substrate == "Ibuprofen_mean") 
+data_ibuprofen <- na.omit(data_ibuprofen)
+
+ibuprofen_a <- data_ibuprofen %>%
+   filter(Culture %in% c("I", "IPCAE", "ICA")) %>%
+  ggplot(aes(x = as.factor(Day), y = percentage, col=Culture,group=Culture)) +   
+ geom_point()+
+  geom_line()+ 
+  geom_text_repel(data = subset(data_ibuprofen, as.factor(Day) == "11" & Culture %in% c("I", "IPCAE", "ICA")),
+    aes(label = Culture),
+    size = 3,
+    segment.color = NA,x = 5.2, nudge_y = -5)+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=49, linetype="dashed", color = "black")+
+theme_bw()+
+ylim(0, 100)+
+  ylab("ibuprofen \n[mg/L]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+    theme(legend.position = "none")
+
+  
+
+
+ibuprofen_b<- data_ibuprofen %>%
+   filter(Day == "11") %>%
+   ggplot() +  
+   geom_point(aes(x = Culture, y = percentage))+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= Culture),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))+ylim(40, 100)+
+  ylab("ibuprofen \n[mg/L] day 11")+
+    theme(plot.title = element_text(size = 10))+
+  theme(axis.title.x = element_text(vjust=2.5))
+
+
+
+# paracetamol
+
+data_paracetamol <- data_full %>%
+   filter(Substrate == "Paracetamol_mean") 
+data_paracetamol <- na.omit(data_paracetamol)
+
+paracetamol_a <- data_paracetamol %>%
+   filter(Culture %in% c("P","PC","PAE", "PECA")) %>%
+     ggplot(aes(x = as.factor(Day), y = percentage, col=Culture,group=Culture)) +   
+ geom_point()+
+  geom_line()+ 
+  geom_text_repel(data = subset(data_paracetamol, as.factor(Day) == "11" & Culture %in% c("P","PC","PAE", "PECA")),
+    aes(label = Culture),
+    size = 3,x=5.2,y=15,hjust="right",
+    segment.color = NA)+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ylim(0, 100)+
+  ylab("paracetamol \n[mg/L]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+    theme(legend.position = "none")
+
+
+paracetamol_b <- data_paracetamol %>%
+  filter(Day =="3") %>%
+               ggplot(aes(x = Culture, y = percentage)) +  
+  geom_point()+
+  geom_hline(yintercept=50, linetype="dashed", color = "black")+
+    geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x=Culture),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+       theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7)) +
+    ylab("paracetamol \n[mg/L] day 3")+
+   theme(strip.background = element_rect(colour="black",
+                                        fill="white"))+
+    theme(plot.title = element_text(size = 10))+
+  theme(axis.title.x = element_text(vjust=2.5))
+# caffeine
+
+data_caffeine <- data_full %>%
+   filter(Substrate == "Caffein_mean") 
+data_caffeine <- na.omit(data_caffeine)
+
+caffeine_a <- data_caffeine %>%
+   filter(Culture %in% c("C","PC","PCE","ICE","IPCE")) %>%
+     ggplot(aes(x = as.factor(Day), y = percentage, col=Culture,group=Culture)) +   
+ geom_point()+
+  geom_line()+ 
+  geom_text_repel(data = subset(data_caffeine, as.factor(Day) == "11" & Culture %in% c("C","PC","PCE","ICE","IPCE")),
+    aes(label = Culture),
+    size = 3,x=5.2,y=15,hjust="right",
+    segment.color = NA)+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ylim(0, 100)+
+  ylab("caffeine \n[mg/L]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+    theme(legend.position = "none")
+
+
+
+caffeine_b <- data_caffeine %>%
+   filter(Day == "3") %>%
+   ggplot() +  
+   geom_point(aes(x = Culture, y = percentage))+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= Culture),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))+ylim(0, 100)+
+  ylab("caffeine \n[mg/L] day 3")+
+    theme(plot.title = element_text(size = 10))+
+  theme(axis.title.x = element_text(vjust=2.5))
+ 
+# enalapril
+
+data_enalapril <- data_full %>%
+   filter(Substrate == "Enalapril_mean") 
+data_enalapril <- na.omit(data_enalapril)
+
+enalapril_a <- data_enalapril %>%
+   filter(Culture %in% c("E","PE","IPCAE","IPCE", "CAE")) %>%
+   ggplot(aes(x = as.factor(Day), y = percentage, col=Culture,group=Culture)) +   
+ geom_point()+
+  geom_line()+ 
+  geom_text_repel(data = subset(data_enalapril, as.factor(Day) == "11" & Culture %in% c("E","PE","IPCAE","IPCE", "CAE")),
+    aes(label = Culture),
+    size = 3,x=5.3,hjust="right",
+    segment.color = NA)+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ylim(0, 100) +
+  ylab("enalapril \n[mg/L]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10), axis.title.y = element_text(size = 15))+
+    theme(legend.position = "none")
+ 
+enalapril_b <- data_enalapril %>%
+   filter(Day == "11") %>%
+   ggplot() +  
+   geom_point(aes(x = Culture, y = percentage))+
+  geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x= Culture),width=0.1, size=0.5, color="grey")+
+geom_hline(yintercept=50, linetype="dashed", color = "black")+
+theme_bw()+
+ theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))+ylim(0, 100)+
+  ylab("enalapril \n[mg/L] day 11")+
+    theme(plot.title = element_text(size = 10))
+
+```
+
+
+#statistics
+
+```{r}
+data <- read_excel("natalie_final.xlsx", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+      "numeric", "numeric"))
+
+
+data <- data %>%
+  mutate(I=ifelse(grepl("I",Culture),1,
+                  ifelse(Culture != "I", 0, NA)),
+        P=ifelse(grepl("P",Culture),1,
+                  ifelse(Culture != "P", 0, NA)),
+         C=ifelse(grepl("C",Culture),1,
+                  ifelse(Culture != "C", 0, NA)),
+         A=ifelse(grepl("A",Culture),1,
+                  ifelse(Culture != "A", 0, NA)),
+         E=ifelse(grepl("E",Culture),1,
+                  ifelse(Culture != "E", 0, NA)))
+
+data$Ibuprofen = ifelse(data$Ibuprofen>100,100, data$Ibuprofen)
+
+  
+data_day3 <- data %>%
+  filter(Day=="3")
+data_day4 <- data %>%
+  filter(Day=="4")
+data_day7 <- data %>%
+  filter(Day=="7")
+data_day11 <- data %>%
+  filter(Day=="11")
+
+
+ano_I_3 <- lm(Ibuprofen~P*C*A*E, data = data_day3)
+ano_I_4 <- lm(Ibuprofen~P*C*A*E, data = data_day4)
+ano_I_7 <- lm(Ibuprofen~P*C*A*E, data = data_day7)
+ano_I_11 <- lm(Ibuprofen~P*C*A*E, data = data_day11)
+
+ano_P_3 <- lm(Paracetamol~I*C*A*E, data = data_day3)
+ano_P_4 <- lm(Paracetamol~I*C*A*E, data = data_day4)
+ano_P_7 <- lm(Paracetamol~I*C*A*E, data = data_day7)
+ano_P_11 <- lm(Paracetamol~I*C*A*E, data = data_day11)
+
+ano_C_3 <- lm(Caffein~I*P*A*E, data = data_day3)
+ano_C_4 <- lm(Caffein~I*P*A*E, data = data_day4)
+ano_C_7 <- lm(Caffein~I*P*A*E, data = data_day7)
+ano_C_11 <- lm(Caffein~I*P*A*E, data = data_day11)
+
+ano_E_3 <- lm(Enalapril~I*P*A*C, data = data_day3)
+ano_E_4 <- lm(Enalapril~I*P*A*C, data = data_day4)
+ano_E_7 <- lm(Enalapril~I*P*A*C, data = data_day7)
+ano_E_11 <- lm(Enalapril~I*P*A*C, data = data_day11)
+
+ano_A_3 <- lm(Atenolol~I*P*E*C, data = data_day3)
+ano_A_4 <- lm(Atenolol~I*P*E*C, data = data_day4)
+ano_A_7 <- lm(Atenolol~I*P*E*C, data = data_day7)
+ano_A_11 <- lm(Atenolol~I*P*E*C, data = data_day11)
+```
+
+
+# extract t- and F-values for analytic data
+```{r}
+#Ibu
+Ibu_day3 <- extract_test_values(ano_I_3, "day3")
+Ibu_day3$compound <- "[Ibuprofen]"
+Ibu_day4 <- extract_test_values(ano_I_4, "day4")
+Ibu_day4$compound <- "[Ibuprofen]"
+Ibu_day7 <- extract_test_values(ano_I_7, "day7")
+Ibu_day7$compound <- "[Ibuprofen]"
+Ibu_day11 <- extract_test_values(ano_I_11, "day11")
+Ibu_day11$compound <- "[Ibuprofen]"
+
+#Para
+Para_day3 <- extract_test_values(ano_P_3, "day3")
+Para_day3$compound <- "[Paracetamol]"
+Para_day4 <- extract_test_values(ano_P_4, "day4")
+Para_day4$compound <- "[Paracetamol]"
+Para_day7 <- extract_test_values(ano_P_7, "day7")
+Para_day7$compound <- "[Paracetamol]"
+Para_day11 <- extract_test_values(ano_P_11, "day11")
+Para_day11$compound <- "[Paracetamol]"
+
+
+#Caffein
+Caff_day3 <- extract_test_values(ano_C_3, "day3")
+Caff_day3$compound <- "[Caffein]"
+Caff_day4 <- extract_test_values(ano_C_4, "day4")
+Caff_day4$compound <- "[Caffein]"
+Caff_day7 <- extract_test_values(ano_C_7, "day7")
+Caff_day7$compound <- "[Caffein]"
+Caff_day11 <- extract_test_values(ano_C_11, "day11")
+Caff_day11$compound <- "[Caffein]"
+
+
+
+#Enalapril
+Ena_day3 <- extract_test_values(ano_E_3, "day3")
+Ena_day3$compound <- "[Enalapril]"
+Ena_day4 <- extract_test_values(ano_E_4, "day4")
+Ena_day4$compound <- "[Enalapril]"
+Ena_day7 <- extract_test_values(ano_E_7, "day7")
+Ena_day7$compound <- "[Enalapril]"
+Ena_day11 <- extract_test_values(ano_E_11, "day11")
+Ena_day11$compound <- "[Enalapril]"
+
+#Atenolol
+Ate_day3 <- extract_test_values(ano_A_3, "day3")
+Ate_day3$compound <- "[Atenolol]"
+Ate_day4 <- extract_test_values(ano_A_4, "day4")
+Ate_day4$compound <- "[Atenolol]"
+Ate_day7 <- extract_test_values(ano_A_7, "day7")
+Ate_day7$compound <- "[Atenolol]"
+Ate_day11 <- extract_test_values(ano_A_11, "day11")
+Ate_day11$compound <- "[Atenolol]"
+
+```
+
+```{r}
+all_hplc <- rbind(Ibu_day3,Ibu_day4,Ibu_day7,Ibu_day11,Para_day3, Para_day4,Para_day7,Para_day11,Caff_day3,Caff_day4,Caff_day7,Caff_day11,Ena_day3,Ena_day4,Ena_day7,Ena_day11,Ate_day3,Ate_day4,Ate_day7,Ate_day11)
+
+                                
+all_hplc <- all_hplc %>% 
+   reorder_levels(treatment_combination, order = c("I","P","C", "A","E","I:P","I:C","P:C","I:A","P:A","C:A","A:C","I:E","P:E","E:C","C:E","A:E","I:P:C", "I:P:A","I:C:A", "P:C:A","I:P:E","I:E:C","I:C:E","P:E:C","I:A:E","P:A:E","C:A:E","P:A:C","P:C:E","I:A:C","I:P:A:C","I:P:E:C","I:P:A:E","I:C:A:E","P:C:A:E","I:P:C:A:E"))
+
+
+all_hplc <- all_hplc %>% 
+   reorder_levels(variable, order = c("day3","day4","day7", "day11"))
+
+table_of_significance_pollutant_concentration=subset(all_hplc, select = -c(6,11))
+
+write_xlsx(table_of_significance_pollutant_concentration,"table_of_significance_pollutant_concentration.xlsx")
+
+
+
+```
+
+# function for HPLC heatmaps and plots
+```{r}
+plot_interaction_matrix <- function(all_hplc, compound_oi) {
+  result <- all_hplc %>%
+    filter(compound==compound_oi) %>%
+    ggplot(aes(x = variable, y = treatment_combination, fill=est_1)) + 
+    geom_tile() +
+    scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                         midpoint=0,
+                         breaks=c(-100,0,100),
+                         limits=c(-100,100),
+                         na.value="white") +
+    theme(strip.placement = "inside") +
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+    theme(axis.text.y = element_text(angle = 0, hjust = 1,size=8)) +
+    theme(strip.text = element_text(size=8))+
+    labs(fill = "estimates")+
+    theme(legend.position = "right")+
+    theme(axis.title.y = element_blank())+
+    theme(axis.title.x = element_blank())+
+    ggtitle(compound_oi)+
+    theme(plot.title = element_text(size = 10),
+          axis.text.x = element_text(size = 8))+
+  scale_y_discrete(position = "right")
+  result
+}
+
+
+all_hplc <- all_hplc |> 
+  mutate(est_1 = ifelse(abs(estimate) > 5 & f_p.value < 0.05, estimate, NA))
+
+compound_oi <- "[Ibuprofen]"
+ibuprofen_c <- plot_interaction_matrix(all_hplc, compound_oi)
+
+ibuprofen_c
+
+compound_oi <- "[Paracetamol]"
+paracetamol_c <- plot_interaction_matrix(all_hplc, compound_oi)
+paracetamol_c
+
+compound_oi <- "[Caffein]"
+caffein_c <- plot_interaction_matrix(all_hplc, compound_oi)
+caffein_c
+
+compound_oi <- "[Enalapril]"
+enalapril_c <- plot_interaction_matrix(all_hplc, compound_oi)
+enalapril_c
+
+compound_oi <- "[Atenolol]"
+atenolol_c <- plot_interaction_matrix(all_hplc, compound_oi)
+atenolol_c
+```
+
+
+# figure 1
+
+```{r}
+(paracetamol_a+ labs(tag="a") + paracetamol_b + paracetamol_c)/
+  (caffeine_a+ labs(tag="b")  + caffeine_b + caffein_c)/
+  (atenolol_a+ labs(tag="c")  + atenolol_b + atenolol_c)/
+  (enalapril_a+ labs(tag="d")  + enalapril_b + enalapril_c)/
+  (ibuprofen_a+ labs(tag="e")  + ibuprofen_b + ibuprofen_c ) + plot_layout(guides = "collect") +
+plot_annotation(title = "                             dynamics                              effect of treatment combination               effect sizes")
+
+```
+
+
+
+#effect of enalapril on degradation of ibuprofene depending on other compounds present
+
+```{r}
+
+ data_full_new <- data_full %>%
+  mutate(I=ifelse(grepl("I",Culture),1,
+                  ifelse(Culture != "I", 0, NA)),
+        P=ifelse(grepl("P",Culture),1,
+                  ifelse(Culture != "P", 0, NA)),
+         C=ifelse(grepl("C",Culture),1,
+                  ifelse(Culture != "C", 0, NA)),
+         A=ifelse(grepl("A",Culture),1,
+                  ifelse(Culture != "A", 0, NA)),
+         E=ifelse(grepl("E",Culture),1,
+                  ifelse(Culture != "E", 0, NA)))
+
+data_full_new <- data_full_new %>%
+  filter(Day=="11", Substrate == "Ibuprofen_mean") %>%
+  na.omit()
+
+data_full_new_E <-  data_full_new %>%
+  filter(E=="1")
+
+data_full_new_E <- data_full_new_E %>%
+  rename(
+    percentageE = percentage)
+data_full_new_E = subset(data_full_new_E, select = c(1,4))
+
+data_full_new_E <- data_full_new_E %>%
+  mutate(Culture =gsub("E", "", Culture))
+
+
+data_full_new_noE <-  data_full_new %>%
+  filter(E=="0")
+
+data_full_new_noE = subset(data_full_new_noE, select = c(1,4))
+
+all <- merge(data_full_new_E, data_full_new_noE, by = "Culture")
+
+all <- all %>%
+  mutate(delta=percentageE-percentage)
+
+
+all$Culture <- factor(
+all$Culture , levels=c("I","IA","IC","IP","ICA","IPA","IPC","IPCA"))
+
+
+
+
+
+all %>%
+  ggplot() +
+  geom_point(aes(x=Culture, y=delta)) +
+    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+theme_bw()+
+  ggtitle("Effect of presence of Enalapril \non degradation of ibuprofen depending \non additional compounds present")+
+ylab("Δ[Ibuprofen] \n ([Ibuprofen] with E present - [Ibuprofen ] no E present)")+
+  xlab("other compounds present")
+
+
+
+# now with P
+data_full_new <- data_full_new %>%
+  filter(Day=="11", Substrate == "Paracetamol_mean") %>%
+  na.omit()
+
+data_full_new_P <-  data_full_new %>%
+  filter(P=="1")
+
+data_full_new_P <- data_full_new_P %>%
+  rename(
+    percentageE = percentage)
+data_full_new_P = subset(data_full_new_P, select = c(1,4))
+
+data_full_new_P <- data_full_new_P %>%
+  mutate(Culture =gsub("P", "", Culture))
+
+
+data_full_new_noP <-  data_full_new %>%
+  filter(P=="0")
+
+data_full_new_noP = subset(data_full_new_noP, select = c(1,4))
+
+all <- merge(data_full_new_P, data_full_new_noP, by = "Culture")
+
+all <- all %>%
+  mutate(delta=percentageE-percentage)
+
+all %>%
+  ggplot() +
+  geom_point(aes(x=Culture, y=delta)) +
+    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+theme_bw()+
+  ggtitle("effect on presence of E on degradation of ibuprofene depending on treatment combination")
+
+
+
+
+
+
+
+```
+
+
+
+
+
+# Creating phyloseq
+
+```{r}
+ps <- readRDS("ps_nat.RDS")
+taxa_names(ps) <- paste0("Seq", seq(ntaxa(ps)))
+```
+
+
+# DNA concentration of the batch cultures
+
+```{r}
+dna_raw <- read_excel("dna_conc.xlsx", col_types = c("text", 
+    "numeric", "numeric"))
+
+dna_raw$Treatment <- gsub("[[:digit:]]","", dna_raw$Treatment)
+
+dna <- dna_raw %>%
+  group_by(Treatment,Day) %>%
+  dplyr::summarise(DNA_mean = mean(DNA),
+                   DNA_error = stderr(DNA))
+
+dna$Treatment <- factor(dna$Treatment, levels=c("NK","I","P","C","A","E", "IP","IC","IA","IE","PC","PA","PE","CA","CE","AE","IPC","IPA","IPE","ICA","ICE","IAE","PCA","PCE","PAE","CAE","IPCA","IPCE","IPAE","ICAE","PECA","IPCAE"))
+
+dna %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=DNA_mean, col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=DNA_mean-DNA_error,ymax=DNA_mean+DNA_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+#facet_grid("Day") +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+dna %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=DNA_mean, col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=DNA_mean-DNA_error,ymax=DNA_mean+DNA_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+facet_wrap("Day") +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+biomass_dynamics <- dna %>%
+  filter(Treatment %in% c("NK","C","PA","A","ICA","IPCAE","PCA","P")) %>%
+   ggplot(aes(x = as.factor(Day), y = DNA_mean,group=Treatment,col=Treatment)) +  
+   geom_point(size=2,position=position_dodge(width = 0.1))+
+  geom_line(position=position_dodge(width = 0.1))+ 
+  geom_text_repel(data = subset(dna, as.factor(Day) == "11" & Treatment %in% c("NK","C","PA","A","ICA","IPCAE","PCA","P")),
+    aes(label = Treatment),
+    size = 3,x=2.1,hjust="right")+
+  geom_errorbar(aes(ymin=DNA_mean-DNA_error,ymax=DNA_mean+DNA_error, x= as.factor(Day)),width=0.1, size=0.5, color="grey",position=position_dodge(width = 0.1))+
+theme_bw()+
+  ylab("Biomass \n[DNA ng/µL]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=0))+
+  theme(legend.position="none")
+
+
+biomass_effect_1_day <- dna %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=DNA_mean,col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=DNA_mean-DNA_error,ymax=DNA_mean+DNA_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))+
+  ylab("Biomass [DNA ng/µL]")+
+    theme(legend.position = "none")
+
+  
+```
+
+
+# DNA concentration on pollutant dependency
+```{r}
+dna_raw <- read_excel("dna_conc.xlsx", col_types = c("text", 
+    "numeric", "numeric"))
+
+dna_raw <- dna_raw %>%
+  mutate(I=ifelse(grepl("I",Treatment),1,
+                  ifelse(Treatment != "I", 0)),
+        P=ifelse(grepl("P",Treatment),1,
+                  ifelse(Treatment != "P", 0)),
+         C=ifelse(grepl("C",Treatment),1,
+                  ifelse(Treatment != "C", 0)),
+         A=ifelse(grepl("A",Treatment),1,
+                  ifelse(Treatment != "A", 0)),
+         E=ifelse(grepl("E",Treatment),1,
+                  ifelse(Treatment != "E", 0)))
+
+dna_anova_day3 <- dna_raw %>%
+  filter(Day=="3")
+
+anova_biomass_day3<- lm(DNA~I*P*C*A*E, data = dna_anova_day3)
+
+anova(anova_biomass_day3)
+summary(anova_biomass_day3)
+autoplot(anova_biomass_day3)
+
+
+
+
+dna_anova_day11 <- dna_raw %>%
+  filter(Day=="11")
+
+anova_biomass_day11<- lm(DNA~I*P*C*A*E, data = dna_anova_day11)
+anova(anova_biomass_day11)
+summary(anova_biomass_day11)
+
+```
+
+
+# Diversity
+
+```{r}
+rich <- as.data.frame(estimate_richness(ps,  measures=c("Observed","Shannon")))
+rich$Name <- rownames(rich)
+
+rich$Name <- gsub('\\.', '-', rich$Name)
+rownames(rich) <- NULL
+
+data <- sample_data(ps)
+data <- as_tibble(data)
+rownames(data) <- NULL
+
+observed <- merge(data,rich, by.x="sample.names", by.y="Name")
+
+observed %>%
+  ggplot() +
+  facet_grid("Day") +
+  geom_point(aes(x=sample.names, y=Shannon),size=2) +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+observed$Treatment <- observed$sample.names
+observed$Treatment <- gsub("[[:digit:]]","", observed$Treatment)
+observed$Treatment <- gsub("-","", observed$Treatment)
+
+
+observed_mean <- observed %>%
+  group_by(Treatment,Day) %>%
+  dplyr::summarise(Shannon_mean = mean(Shannon),
+                   Observed_mean = mean(Observed),
+                   Shannon_error=stderr(Shannon),
+                   Observed_error=stderr(Observed))
+                   
+observed_mean$Treatment <- factor(observed_mean$Treatment, levels=c("NK","I","P","C","A","E", "IP","IC","IA","IE","PC","PA","PE","CA","CE","AE","IPC","IPA","IPE","ICA","ICE","IAE","PCA","PCE","PAE","CAE","IPCA","IPCE","IPAE","ICAE","PECA","IPCAE"))
+
+
+observed_mean %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=Shannon_mean, col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=Shannon_mean-Shannon_error,ymax=Shannon_mean+Shannon_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+
+observed_mean %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=Shannon_mean, col=as.factor(Day)),size=3) +
+  geom_errorbar(aes(ymin=Shannon_mean-Shannon_error,ymax=Shannon_mean+Shannon_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+facet_wrap("Day") +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+diversity_dynamics <- observed_mean %>%
+   filter(Treatment %in% c("A", "I", "IPCAE", "ICA", "PECA","IPAE","CAE")) %>%
+   ggplot(aes(x = as.factor(Day), y = Shannon_mean,group=Treatment,col=Treatment)) +  
+   geom_point(size=2)+
+  geom_line()+ 
+  geom_text_repel(data = subset(observed_mean, as.factor(Day) == "11" & Treatment %in% c("A", "I", "IPCAE", "ICA", "PECA","IPAE","CAE")),
+    aes(label = Treatment),
+    size = 3,x=2.1,hjust="right")+
+  geom_errorbar(aes(ymin=Shannon_mean-Shannon_error,ymax=Shannon_mean+Shannon_error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+  ylab("Diversity \nShannon_index")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+  theme(legend.position="none")
+
+print(diversity_dynamics)
+
+diversity_effect_1_day <- observed_mean %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=Shannon_mean,col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=Shannon_mean-Shannon_error,ymax=Shannon_mean+Shannon_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))+
+    theme(legend.position = "none")
+
+plot_richness <- observed_mean %>%
+  ggplot() +
+  geom_point(aes(x=Treatment, y=Shannon_mean, col=as.factor(Day)),size=2) +
+  geom_errorbar(aes(ymin=Shannon_mean-Shannon_error,ymax=Shannon_mean+Shannon_error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+
+
+
+```
+
+# Anova Diversity
+```{r}
+
+observed_day3 <- observed %>%
+  filter(Day=="3")
+
+observed_day11 <- observed %>%
+  filter(Day=="11")
+
+
+anova_diversity_day3 <- lm(Shannon~I*P*C*A*E, data = observed_day3)
+autoplot(anova_diversity_day3)
+anova(anova_diversity_day3)
+summary(anova_diversity_day3)
+
+anova_diversity_day11 <- lm(Shannon~I*P*C*A*E, data = observed_day11)
+autoplot(anova_diversity_day11)
+anova(anova_diversity_day11)
+summary(anova_diversity_day11)
+
+lm1<-lm(Shannon~Number_factors, data = observed_day11)
+anova(lm1)
+summary(lm1)
+
+test <- lm(resid(lm1) ~I+P+A+E+C, data = observed_day11)
+anova(test)
+```
+
+
+# Microbial community composition
+## Threshold for abundance
+```{r}
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x) )
+relab_threshold <- 0.04
+ps_relab <- filter_taxa(ps_rel, function(x) !(sum(x < relab_threshold) == length(x)), TRUE)
+ntaxa(ps)
+ntaxa(ps_relab)
+ps_relative <- transform_sample_counts(ps_relab, function(x)  x / sum(x))
+
+df_final <- psmelt(ps_relative)
+```
+
+```{r}
+
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_genus$Treatment <- df_genus$Sample
+df_genus$Treatment <- gsub("[[:digit:]]","", df_genus$Treatment)
+df_genus$Treatment <- gsub("-","", df_genus$Treatment)
+
+df_genus_mean <- df_genus %>%
+  group_by(Treatment,Day,Genus) %>%
+  dplyr::summarise(Abundance_mean = mean(Abundance),
+                   Error= stderr(Abundance))
+
+
+
+df_genus_mean$Treatment <- factor(df_genus_mean$Treatment, levels=c("NK","I","P","C","A","E", "IP","IC","IA","IE","PC","PA","PE","CA","CE","AE","IPC","IPA","IPE","ICA","ICE","IAE","PCA","PCE","PAE","CAE","IPCA","IPCE","IPAE","ICAE","PECA","IPCAE"))
+
+
+plot_community <- df_genus_mean%>%
+  ggplot(aes_string(x = "Treatment", y = "Abundance_mean", fill="Genus" )) +
+     geom_bar(stat = "identity", position = "stack", col="black") +
+  theme_bw()+
+  facet_grid("Day")+
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))+
+    ylab("Relative abundance")+
+  theme(legend.text = element_text(face = "italic"))
+
+   cols <-c("Achromobacter"="black", "Acinetobacter" ="red","Pseudomonas"="darkgreen","Trichococcus"="blue","Zoogloea"="pink","Tumebacillus"="grey","Comamonas"="green" )
+ 
+
+print(plot_community)
+
+
+plot_species <- df_genus_mean%>%
+  filter(Genus %in% c("Pseudomonas","Trichococcus"))%>%
+  ggplot()+
+  geom_point(aes(x= Treatment, y= Abundance_mean,col=Genus,shape=Genus),
+             size = 2) + 
+    geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error,x=Treatment),width=0.1, size=0.5, color="grey")+
+    scale_colour_manual(values=c("Achromobacter"="black", "Acinetobacter" ="red","Pseudomonas"="darkgreen","Trichococcus"="blue","Tumebacillus"="grey","Comamonas"="green" ))+
+  facet_grid(Day~Genus)+
+  ylab("Relative abundance")+
+  theme_bw()+
+   theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=8))+
+  theme(legend.position="bottom")+
+    theme(legend.text = element_text(face = "italic"))+
+  theme(strip.text = element_text(face = "italic"))
+
+print(plot_species)
+
+#Achromobacter
+Achromobacter_dynamics <- df_genus_mean%>%
+  filter(Genus == "Achromobacter", Treatment %in% c("P", "I", "IPCAE","IPAE","ICA","CAE")) %>%
+   ggplot(aes(x = as.factor(Day), y = Abundance_mean,group=Treatment,col=Treatment)) +  
+   geom_line()+
+   geom_point()+
+  geom_text_repel(data = subset(df_genus_mean, as.factor(Day) == "11" & Treatment %in% c("P", "I", "IPCAE","IPAE","ICA","CAE") & Genus == "Achromobacter"),
+    aes(label = Treatment),
+    size = 3,x=2.2,hjust="right")+
+  geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+  ylab("Achromobacter \nrel. abundance [%]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+  theme(legend.position = "none")
+
+
+Achromobacter_effect_1_day <- df_genus_mean%>%
+  filter(Genus =="Achromobacter")%>%
+  ggplot()+
+  geom_point(aes(x= Treatment, y= Abundance_mean,col=as.factor(Day)),
+             size = 2) + 
+    geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  ylab("Relative abundance [%]")+
+  theme_bw()+
+    theme(legend.position = "none")+
+  theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))
+
+
+# Acinetobacter
+Acinetobacter_dynamics <- df_genus_mean%>%
+  filter(Genus == "Acinetobacter", Treatment %in% c("P", "I", "IPCAE","IPAE","CAE")) %>%
+   ggplot(aes(x = as.factor(Day), y = Abundance_mean,group=Treatment,col=Treatment)) +  
+   geom_line()+
+   geom_point(size=2)+
+  geom_text_repel(data = subset(df_genus_mean, as.factor(Day) == "11" & Genus == "Acinetobacter" & Treatment %in% c("P", "I", "IPCAE","IPAE","CAE")),
+    aes(label = Treatment),
+    size = 3,x=2.2,hjust="right")+
+geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+  ylab("Acinetobacter \nrel. abundance [%]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+  theme(legend.position="none")
+
+
+Acinetobacter_effect_1_day <- df_genus_mean%>%
+  filter(Genus =="Acinetobacter")%>%
+  ggplot()+
+  geom_point(aes(x= Treatment, y= Abundance_mean,col=as.factor(Day)),
+             size = 2) + 
+    geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  ylab("Relative abundance [%]")+
+  theme_bw()+
+    theme(legend.position = "none")+
+  theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))
+
+
+# Comamonas
+Comamonas_dynamics <- df_genus_mean%>%
+  filter(Genus == "Comamonas", Treatment %in% c("P","A","PA","IA", "IPCAE","AE")) %>%
+   ggplot(aes(x = as.factor(Day), y = Abundance_mean,group=Treatment,col=Treatment)) +  
+   geom_line()+
+   geom_point(size=2)+
+  geom_text_repel(data = subset(df_genus_mean, as.factor(Day) == "11" & Genus == "Comamonas" & Treatment %in% c("P","A","PA","IA", "IPCAE","AE")),
+    aes(label = Treatment),
+    size = 3,x=2.2,hjust="right")+
+geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error, x= as.factor(Day)),width=0.1, size=0.5, color="grey")+
+theme_bw()+
+  ylab("Comamonas \nrel. abundance [%]")+
+    xlab("Time [days]")+
+    theme(plot.title = element_text(size = 10),axis.title.y = element_text(size = 15))+
+  theme(axis.title.x = element_text(vjust=2.5))+
+  theme(legend.position="none")
+
+
+Comamonas_effect_1_day <- df_genus_mean%>%
+  filter(Genus =="Comamonas")%>%
+  ggplot()+
+  geom_point(aes(x= Treatment, y= Abundance_mean,col=as.factor(Day)),
+             size = 2) + 
+    geom_errorbar(aes(ymin=Abundance_mean-Error,ymax=Abundance_mean+Error,x=Treatment),width=0.1, size=0.5, color="grey")+
+  ylab("Relative abundance [%]")+
+  theme_bw()+
+    theme(legend.position = "bottom")+
+  theme(axis.text.x = element_text(angle = -60, hjust = 0, vjust=0.5, size=7))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+
+# Anova Species abundance
+## Achromobacter
+```{r}
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample,I,P,C,A,E)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_Achromobacter_day3 <- df_genus %>%
+  filter(Genus =="Achromobacter", Day=="3")
+
+anova_Achromobacter_day3 <- lm(Abundance~I*P*C*A*E, data = df_Achromobacter_day3)
+autoplot(anova_Achromobacter_day3)
+anova(anova_Achromobacter_day3)
+summary(anova_Achromobacter_day3)
+
+df_Achromobacter_day11<- df_genus %>%
+  filter(Genus =="Achromobacter", Day=="11")
+
+
+anova_Achromobacter_day11 <- lm(Abundance~I*P*C*A*E, data = df_Achromobacter_day11)
+autoplot(anova_Achromobacter_day11)
+anova(anova_Achromobacter_day11)
+summary(anova_Achromobacter_day11)
+```
+
+
+## Acinetobacter
+
+```{r}
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample,I,P,C,A,E)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_Acinetobacter_day3 <- df_genus %>%
+  filter(Genus =="Acinetobacter", Day=="3")
+
+anova_Acinetobacter_day3 <- lm(Abundance~I*P*C*A*E, data = df_Acinetobacter_day3)
+autoplot(anova_Acinetobacter_day3)
+anova(anova_Acinetobacter_day3)
+summary(anova_Acinetobacter_day3)
+
+df_Acinetobacter_day11<- df_genus %>%
+  filter(Genus =="Acinetobacter", Day=="11")
+
+
+anova_Acinetobacter_day11 <- lm(Abundance~I*P*C*A*E, data = df_Acinetobacter_day11)
+autoplot(anova_Acinetobacter_day11)
+anova(anova_Acinetobacter_day11)
+summary(anova_Acinetobacter_day11)
+```
+
+## Pseudomonas
+
+```{r}
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample,I,P,C,A,E)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_Pseudomonas_day3 <- df_genus %>%
+  filter(Genus =="Pseudomonas", Day=="3")
+
+anova_Pseudomonas_day3 <- lm(Abundance~I*P*C*A*E, data = df_Pseudomonas_day3)
+autoplot(anova_Pseudomonas_day3)
+anova(anova_Pseudomonas_day3)
+summary(anova_Pseudomonas_day3)
+
+df_Pseudomonas_day11<- df_genus %>%
+  filter(Genus =="Pseudomonas", Day=="11")
+
+anova_Pseudomonas_day11 <- lm(Abundance~I*P*C*A*E, data = df_Pseudomonas_day11)
+autoplot(anova_Pseudomonas_day11)
+anova(anova_Pseudomonas_day11)
+summary(anova_Pseudomonas_day11)
+```
+
+## Trichococcus
+
+```{r}
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample,I,P,C,A,E)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_Trichococcus_day3 <- df_genus %>%
+  filter(Genus =="Trichococcus", Day=="3")
+
+anova_Trichococcus_day3 <- lm(Abundance~I*P*C*A*E, data = df_Trichococcus_day3)
+autoplot(anova_Trichococcus_day3)
+anova(anova_Trichococcus_day3)
+summary(anova_Trichococcus_day3)
+
+df_Trichococcus_day11<- df_genus %>%
+  filter(Genus =="Trichococcus", Day=="11")
+
+anova_Trichococcus_day11 <- lm(Abundance~I*P*C*A*E, data = df_Trichococcus_day11)
+autoplot(anova_Trichococcus_day11)
+anova(anova_Trichococcus_day11)
+summary(anova_Trichococcus_day11)
+```
+
+## Comamonas
+
+```{r}
+df_genus <- df_final%>%
+  group_by(Genus, Day, Sample,I,P,C,A,E)%>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+df_Comamonas_day3 <- df_genus %>%
+  filter(Genus =="Comamonas", Day=="3")
+
+anova_Comamonas_day3 <- lm(Abundance~I*P*C*A*E, data = df_Comamonas_day3)
+autoplot(anova_Comamonas_day3)
+anova(anova_Comamonas_day3)
+summary(anova_Comamonas_day3)
+
+df_Comamonas_day11<- df_genus %>%
+  filter(Genus =="Comamonas", Day=="11")
+
+anova_Comamonas_day11 <- lm(Abundance~I*P*C*A*E, data = df_Comamonas_day11)
+autoplot(anova_Comamonas_day11)
+anova(anova_Comamonas_day11)
+summary(anova_Comamonas_day11)
+```
+
+#NMDS 
+```{r}
+mds_whole <- ps@otu_table %>%
+  as.data.frame() %>%
+  metaMDS(., 
+          distance = "bray", # trace = F silences the output
+          k = 2, ## number of dimensions to reduce to
+          try = 500, ## number of random starts to try
+          autotransform = FALSE) ## best not to use
+
+
+mds_whole_res <- ps@sam_data %>%
+  as.tibble() %>%
+  bind_cols(as.tibble(scores(mds_whole, display = "sites")))
+
+
+mds_whole_res$Treatment <- mds_whole_res$sample.names
+mds_whole_res$Treatment <- gsub("[[:digit:]]","", mds_whole_res$Treatment)
+mds_whole_res$Treatment <- gsub("-","", mds_whole_res$Treatment)
+
+
+mds_whole_res <- mds_whole_res %>%
+  mutate(paracetamol=ifelse(grepl("P",Treatment),"yes",
+                  ifelse(Treatment != "P", "no", NA)))
+
+plot_NMDS <- mds_whole_res %>%
+ggplot(aes(x = NMDS1, y = NMDS2,label=Treatment)) +
+   # geom_polygon(aes(x=NMDS1,y=NMDS2,fill=paracetamol,group=paracetamol),alpha=0.30) + 
+    geom_point(aes(color=as.factor(Day))) +
+  stat_ellipse(aes(color = paracetamol), geom = "polygon", alpha = 0.1)+
+    geom_text(hjust=-0.1,vjust=0.1,size=3)+
+  theme_bw()+
+  theme(legend.position = "bottom")+
+  labs(color="Day/paracetamol")
+  
+
+print(plot_NMDS)
+
+
+
+
+```
+
+#Anova NMDS
+
+```{r}
+df_nmds_day3 <- mds_whole_res %>%
+  filter(Day=="3")
+
+anova_NMDS1_day3 <- lm(NMDS1~I*P*C*A*E, data = df_nmds_day3)
+autoplot(anova_NMDS1_day3)
+anova(anova_NMDS1_day3)
+summary(anova_NMDS1_day3)
+
+anova_NMDS2_day3 <- lm(NMDS2~I*P*C*A*E, data = df_nmds_day3)
+autoplot(anova_NMDS2_day3)
+anova(anova_NMDS2_day3)
+summary(anova_NMDS2_day3)
+
+df_nmds_day11 <- mds_whole_res %>%
+  filter(Day=="11")
+
+anova_NMDS1_day11<- lm(NMDS1~I*P*C*A*E, data = df_nmds_day11)
+autoplot(anova_NMDS1_day11)
+anova(anova_NMDS1_day11)
+summary(anova_NMDS1_day11)
+
+anova_NMDS2_day11<- lm(NMDS2~I*P*C*A*E, data = df_nmds_day11)
+autoplot(anova_NMDS2_day11)
+anova(anova_NMDS2_day11)
+summary(anova_NMDS2_day11)
+```
+
+#PcOA
+
+```{r}
+pcoa <- transform_sample_counts(ps, function(x) 1E6 * x/sum(x))
+
+pcoa.ord <- ordinate(pcoa, "PCoA", "bray")
+
+plot_ordination(ps, pcoa.ord, color="Day")
+```
+
+
+# extract t- and F-values
+```{r}
+
+#Biomass day 3
+Biomass_day3 <- extract_test_values(anova_biomass_day3, "day3")
+Biomass_day3$column <- "Biomass_day3"
+
+
+#Biomass day 11
+Biomass_day11 <- extract_test_values(anova_biomass_day11, "day11")
+Biomass_day11$column <- "Biomass_day11"
+
+
+#Diversity day 3
+Diversity_day3 <- extract_test_values(anova_diversity_day3, "day3")
+Diversity_day3$column <- "Diversity_day3"
+
+
+#Diversity day 11
+Diversity_day11 <- extract_test_values(anova_diversity_day11, "day11")
+Diversity_day11$column <- "Diversity_day11"
+
+
+#NMDS1 day 3
+NMDS1_day3 <- extract_test_values(anova_NMDS1_day3, "day3")
+NMDS1_day3$column <- "NMDS1_day3"
+
+#NMDS2 day 3
+NMDS2_day3 <- extract_test_values(anova_NMDS2_day3, "day3")
+NMDS2_day3$column <- "NMDS2_day3"
+
+
+#NMDS1 day 11
+NMDS1_day11 <- extract_test_values(anova_NMDS1_day11, "day11")
+NMDS1_day11$column <- "NMDS1_day11"
+
+#NMDS2 day 11
+NMDS2_day11 <- extract_test_values(anova_NMDS2_day11, "day11")
+NMDS2_day11$column <- "NMDS2_day11"
+
+
+#NMDS Achromobacter
+Achromobacter_day3 <- extract_test_values(anova_Achromobacter_day3, "day3")
+Achromobacter_day3$column <- "Achromobacter_day3"
+
+Achromobacter_day11 <- extract_test_values(anova_Achromobacter_day11, "day11")
+Achromobacter_day11$column <- "Achromobacter_day11"
+
+
+
+#NMDS Acinetobacter
+Acinetobacter_day3 <- extract_test_values(anova_Acinetobacter_day3, "day3")
+Acinetobacter_day3$column <- "Acinetobacter_day3"
+
+
+
+Acinetobacter_day11 <- extract_test_values(anova_Acinetobacter_day11, "day11")
+Acinetobacter_day11$column <- "Acinetobacter_day11"
+
+
+#NMDS Pseudomonas
+Pseudomonas_day3 <- extract_test_values(anova_Pseudomonas_day3, "Pseudomonas_day3")
+Pseudomonas_day11 <- extract_test_values(anova_Pseudomonas_day11, "Pseudomonas_day11")
+
+#NMDS Trichococcus
+Trichococcus_day3 <- extract_test_values(anova_Trichococcus_day3, "Trichococcus_day3")
+Trichococcus_day11 <- extract_test_values(anova_Trichococcus_day11, "Trichococcus_day11")
+
+#NMDS Comamonas
+Comamonas_day3 <- extract_test_values(anova_Comamonas_day3, "day3")
+Comamonas_day3$column <- "Comamonas_day3"
+
+
+Comamonas_day11 <- extract_test_values(anova_Comamonas_day11, "day11")
+Comamonas_day11$column <- "Comamonas_day11"
+
+```
+
+
+
+```{r}
+all_heat_new <- rbind(Biomass_day3, Biomass_day11,Diversity_day3,Diversity_day11,Achromobacter_day3,Achromobacter_day11,Acinetobacter_day3, Acinetobacter_day11,Comamonas_day3,Comamonas_day11)
+
+all_heat_new <- all_heat_new %>%
+  reorder_levels(variable,order=c("day3","day11"))
+
+all_heat_new <- all_heat_new %>% 
+   reorder_levels(treatment_combination, order = c("I","P","C", "A","E","I:P","I:C","P:C", "I:A","P:A","C:A","I:E","P:E","C:E","A:E","I:P:C", "I:P:A","I:C:A", "P:C:A","I:P:E","I:C:E","P:C:E","I:A:E","P:A:E","C:A:E","I:P:C:A","I:P:C:E","I:P:A:E","I:C:A:E","P:C:A:E","I:P:C:A:E"))
+
+
+table_of_significance_microbial_data=subset(all_heat_new, select = -c(6,11,12))
+
+write_xlsx(table_of_significance_microbial_data,"table_of_significance_microbial_data.xlsx")
+
+
+```
+
+## heat map of all factors
+```{r}
+
+plot_microbes_statistics <- all_heat_new %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=8)) +
+  ylab("model term [main effect or interaction]")+
+  labs(fill = "Standardized estimate")
+
+
+
+print(plot_microbes_statistics)
+
+
+biomass_statistics <- all_heat_new %>%
+  filter(column %in% c("Biomass_day3", "Biomass_day11")) %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=7)) +
+  ylab("model term")+
+  labs(fill = "Standardized estimate")+
+  theme(legend.position = "none")+
+  theme(axis.title.y = element_blank())+
+  theme(axis.title.x = element_blank())+
+  scale_y_discrete(position = "right")
+
+diversity_statistics <- all_heat_new %>%
+  filter(column %in% c("Diversity_day3", "Diversity_day11")) %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=7)) +
+  ylab("model term")+
+  labs(fill = "Standardized estimate")+
+  theme(legend.position = "none")+
+  theme(axis.title.y = element_blank())+
+  theme(axis.title.x = element_blank())+
+  scale_y_discrete(position = "right")
+
+Achromobacter_statistics <- all_heat_new %>%
+  filter(column %in% c("Achromobacter_day3", "Achromobacter_day11")) %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=7)) +
+  ylab("model term")+
+  labs(fill = "Standardized estimate")+ 
+  theme(legend.position = "none")+
+  theme(axis.title.y = element_blank())+
+  theme(axis.title.x = element_blank())+
+  scale_y_discrete(position = "right")
+
+Acinetobacter_statistics <- all_heat_new %>%
+  filter(column %in% c("Acinetobacter_day3", "Acinetobacter_day11")) %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=7)) +
+  ylab("model term")+
+  labs(fill = "Standardized estimate")+
+  theme(legend.position = "none")+
+  theme(axis.title.y = element_blank())+
+  theme(axis.title.x = element_blank())+
+  scale_y_discrete(position = "right")
+
+
+Comamonas_statistics <- all_heat_new %>%
+  filter(column %in% c("Comamonas_day3", "Comamonas_day11")) %>%
+ggplot(aes(x = variable, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=7)) +
+  ylab("model term")+
+  labs(fill = "Standardized estimate")+
+  theme(legend.position = "bottom")+
+  theme(axis.title.y = element_blank())+
+  theme(axis.title.x = element_blank())+
+  scale_y_discrete(position = "right")
+
+
+```
+
+
+# figure 2
+
+```{r}
+
+
+biomass_dynamics + labs(tag="a")+ biomass_effect_1_day + biomass_statistics+
+  diversity_dynamics+ labs(tag="b") + diversity_effect_1_day+diversity_statistics+
+  Achromobacter_dynamics+ labs(tag="c") + Achromobacter_effect_1_day+ Achromobacter_statistics+
+Acinetobacter_dynamics+ labs(tag="d") + Acinetobacter_effect_1_day + Acinetobacter_statistics +
+  Comamonas_dynamics+ labs(tag="e") + Comamonas_effect_1_day + Comamonas_statistics + plot_layout(ncol = 3,nrow=5,widths = c(2,2, 1)) +
+  plot_annotation(title = "                                             dynamics                                                                      effect of treatment combination                                      effect sizes")
+
+
+```
+
+
+
+
+
+```{r}
+all_heat_nmds <- rbind(NMDS1_day3, NMDS2_day3,NMDS1_day11,NMDS2_day11)
+
+all_heat_nmds <- all_heat_nmds %>%
+  reorder_levels(column,order=c("NMDS1_day3","NMDS1_day11","NMDS2_day3","NMDS2_day11"))
+
+all_heat_nmds <- all_heat_nmds %>% 
+   reorder_levels(treatment_combination, order = c("I","P","C", "A","E","I:P","I:C","P:C", "I:A","P:A","C:A","I:E","P:E","C:E","A:E","I:P:C", "I:P:A","I:C:A", "P:C:A","I:P:E","I:C:E","P:C:E","I:A:E","P:A:E","C:A:E","I:P:C:A","I:P:C:E","I:P:A:E","I:C:A:E","P:C:A:E","I:P:C:A:E"))
+
+```
+
+```{r}
+NMDS_statistics <- all_heat_nmds %>%
+ggplot(aes(x = column, y = treatment_combination, fill=color)) + 
+    geom_tile() +
+  scale_fill_gradient2(low="navy", mid="grey", high="red", 
+                       midpoint=0,breaks=c(-1.0,0,1.0),
+                         na.value="white",
+                           limits=c(-1.0,1.0)
+                    ) +
+  theme(strip.placement = "inside") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=9)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1,size=9)) +
+  ylab("model term")+
+  xlab("")+
+  labs(fill = "Standardized estimate")+
+  theme(legend.position = "bottom")+
+    theme(legend.title = element_text(size=6))+
+   theme(legend.key.size = unit(0.3, 'cm'))
+
+```
+
+# Pathways paracetamol degradation communities
+```{r}
+paracetamol_pathways <- read_excel("paracetamol_pathways_day_11.xlsx")
+
+                                   
+pathways_plot <- paracetamol_pathways %>%
+  ggplot()+
+  geom_point(aes(x=log2FoldChange, y=reorder(pathway, log2FoldChange)))+
+  theme_bw() +
+  theme(text = element_text(size = 10))+
+  ylab("pathway")
+    #scale_y_discrete(position = "right")
+
+```
+
+
+#supplements  plots
+
+```{r}
+
+#figure 2 microbial community 
+plot_community
+
+#figure 2 keyplayers
+
+plot_species 
+
+```
+
+
+# figure 3
+
+```{r}
+plot_NMDS / (NMDS_statistics + pathways_plot) + plot_annotation(tag_levels = 'a') +  plot_layout(heights=c(2,1))
+```
+
+
+
+#HPLC data with 1mg/L pollutant
+
+```{r}
+data_1mg <- read_excel("1mg.xlsx", sheet = "Tabelle2", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+data_area <- data_1mg %>%
+  group_by(Culture,Day) %>%
+  dplyr::summarise(Ibuprofen_mean = mean(Ibuprofen),
+                   Paracetamol_mean = mean(Paracetamol),
+                    Caffein_mean = mean(Caffeine),
+                      Atenol_mean = mean(Atenolol),
+                        Enalapril_mean = mean(Enalapril))
+
+
+data_error <- data_1mg%>%
+  group_by(Culture,Day) %>%
+  dplyr::summarise(Ibu_sd = stderr(Ibuprofen),
+                   Para_sd = stderr(Paracetamol),
+                    Caff_sd = stderr(Caffeine),
+                      Ate_sd = stderr(Atenolol),
+                        Ena_sd = stderr(Enalapril))
+                 
+
+
+data_area  <- data_area %>%
+  pivot_longer(!c(Culture, Day),   names_to = "Substrate", values_to = "percentage")  
+    
+
+data_error  <- data_error%>%
+  pivot_longer(!c(Culture, Day),   names_to = "Substrate", values_to = "error") 
+
+data_error <- subset(data_error, select = -c(Culture,Day,Substrate))
+
+data_full <- cbind(data_area,data_error)
+
+data_full$Culture <- factor(data_full$Culture, levels=c("I","P","C","A","E", "IP","IC","IA","IE","PC","PA","PE","CA","CE","AE","IPC","IPA","IPE","ICA","ICE","IAE","PCA","PCE","PAE","CAE","IPCA","IPCE","IPAE","ICAE","PECA","IPCAE"))
+                            
+
+
+data_full$percentage = ifelse(data_full$percentage>100,100, data_full$percentage)
+
+
+data_full %>%
+    ggplot(aes(x = Day, y = percentage, col=Substrate)) +  
+  geom_point()+
+  geom_line()+
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+   theme(strip.background = element_rect(colour="black",
+                                        fill="white"))+
+  facet_wrap("Culture",scales="free", ncol=5) +
+  geom_hline(yintercept=50, linetype="dashed", color = "black")+
+    geom_errorbar(aes(ymin=percentage-error,ymax=percentage+error, x=Day),width=0.1, size=0.5, color="grey")+
+  ylab("Pollutant [%]")+
+    scale_x_continuous(breaks = seq(from = 0, to = 13, by = 1))+
+  ylim(0,100)+
+  ggtitle("1mg/L pollutant intake")
+
+```
